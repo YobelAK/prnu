@@ -1,0 +1,1176 @@
+import os
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import pearsonr
+from scipy.ndimage import binary_dilation, binary_erosion, label
+from scipy.signal import correlate2d
+import concurrent.futures
+from tqdm import tqdm
+
+# Create necessary directories
+os.makedirs("model", exist_ok=True)
+os.makedirs("frames", exist_ok=True)
+os.makedirs("results", exist_ok=True)
+
+def extract_frames(video_path, output_folder, max_frames=100, stride=1):
+    """
+    Extract frames from video at regular intervals
+
+    Parameters:
+    video_path (str): Path to video file
+    output_folder (str): Folder to store extracted frames
+    max_frames (int): Maximum number of frames to extract
+    stride (int): Extract every 'stride' frames
+
+    Returns:
+    list: Paths to extracted frames
+    dict: Frame metadata
+    """
+    # Create output folder
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Read video
+    vidcap = cv2.VideoCapture(video_path)
+
+    if not vidcap.isOpened():
+        print(f"Error: Cannot open video {video_path}")
+        return [], {}
+
+    # Get video info
+    fps = vidcap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(vidcap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(vidcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration = frame_count / fps
+
+    print(f"Video properties:")
+    print(f"- Dimensions: {width}x{height} pixels")
+    print(f"- FPS: {fps:.2f}")
+    print(f"- Total frames: {frame_count}")
+    print(f"- Duration: {duration:.2f} seconds")
+
+    # Extract frames
+    frame_paths = []
+    metadata = {}
+    count = 0
+    frame_idx = 0
+
+    # Calculate stride for even sampling
+    if frame_count > max_frames * stride:
+        effective_stride = stride
+    else:
+        effective_stride = max(1, frame_count // max_frames)
+
+    print(f"Extracting frames with stride {effective_stride}...")
+
+    with tqdm(total=min(max_frames, frame_count // effective_stride)) as pbar:
+        while count < max_frames:
+            success, image = vidcap.read()
+
+            if not success:
+                break
+
+            if frame_idx % effective_stride == 0:
+                frame_path = os.path.join(output_folder, f"frame_{count:04d}.jpg")
+                cv2.imwrite(frame_path, image)
+                frame_paths.append(frame_path)
+
+                # Store metadata for each frame
+                metadata[frame_path] = {
+                    'frame_idx': frame_idx,
+                    'timestamp': frame_idx / fps,
+                    'path': frame_path
+                }
+
+                count += 1
+                pbar.update(1)
+
+            frame_idx += 1
+
+            if frame_idx >= frame_count:
+                break
+
+    vidcap.release()
+    print(f"Extracted {count} frames")
+
+    return frame_paths, metadata
+
+def denoise_image(image, sigma=1.0):
+    """
+    Denoise image using Gaussian blur as a simple denoising method
+
+    Parameters:
+    image (numpy.ndarray): Input image
+    sigma (float): Gaussian filter strength (higher = more denoising)
+
+    Returns:
+    numpy.ndarray: Denoised image
+    """
+    return cv2.GaussianBlur(image, (0, 0), sigma)
+
+def extract_noise_residual(image, sigma=1.0):
+    """
+    Extract noise residual from image
+
+    Parameters:
+    image (numpy.ndarray): Input image (grayscale)
+    sigma (float): Denoising strength
+
+    Returns:
+    numpy.ndarray: Noise residual
+    """
+    denoised = denoise_image(image, sigma)
+    return image - denoised
+
+def enhance_noise_residual(noise_residual, enhancement_factor=1.0):
+    """
+    Enhance noise residual to make weak patterns more visible
+
+    Parameters:
+    noise_residual (numpy.ndarray): Noise residual
+    enhancement_factor (float): Enhancement strength
+
+    Returns:
+    numpy.ndarray: Enhanced noise residual
+    """
+    if enhancement_factor <= 1.0:
+        return noise_residual
+
+    # Normalize noise residual
+    noise_norm = (noise_residual - np.mean(noise_residual)) / np.std(noise_residual)
+
+    # Apply enhancement
+    enhanced = noise_norm * enhancement_factor
+
+    # Normalize back
+    return enhanced * np.std(noise_residual) + np.mean(noise_residual)
+
+def calculate_prnu(frame_paths, progress_bar=True, denoising_sigma=1.0, enhancement_factor=1.0):
+    """
+    Calculate PRNU pattern from a set of frames
+
+    Parameters:
+    frame_paths (list): List of paths to frames
+    progress_bar (bool): Whether to show progress bar
+    denoising_sigma (float): Denoising strength
+    enhancement_factor (float): Noise enhancement factor
+
+    Returns:
+    numpy.ndarray: PRNU pattern
+    """
+    if not frame_paths:
+        print("Error: No frames provided for PRNU calculation")
+        return None
+
+    # Read first frame to get dimensions
+    first_frame = cv2.imread(frame_paths[0], cv2.IMREAD_GRAYSCALE)
+    if first_frame is None:
+        print(f"Error: Cannot read frame {frame_paths[0]}")
+        return None
+
+    height, width = first_frame.shape
+
+    # Initialize variables for PRNU estimation
+    num = np.zeros((height, width), dtype=np.float64)
+    den = np.zeros((height, width), dtype=np.float64)
+
+    print("Calculating PRNU from frames...")
+    iterator = tqdm(frame_paths) if progress_bar else frame_paths
+
+    for frame_path in iterator:
+        # Read frame
+        frame = cv2.imread(frame_path, cv2.IMREAD_GRAYSCALE)
+        if frame is None:
+            print(f"Warning: Cannot read frame {frame_path}")
+            continue
+
+        if frame.shape != (height, width):
+            print(f"Warning: Frame {frame_path} has different dimensions, resizing")
+            frame = cv2.resize(frame, (width, height))
+
+        # Convert to float
+        frame = frame.astype(np.float64)
+
+        # Extract noise residual with specified denoising strength
+        noise = extract_noise_residual(frame, denoising_sigma)
+
+        # Enhance noise if needed
+        if enhancement_factor > 1.0:
+            noise = enhance_noise_residual(noise, enhancement_factor)
+
+        # Update numerator and denominator
+        num += noise * frame
+        den += frame * frame
+
+    # Avoid division by zero
+    den[den == 0] = 1
+
+    # Calculate PRNU pattern
+    k = num / den
+
+    # Normalize PRNU pattern
+    k = (k - np.mean(k)) / np.std(k)
+
+    return k
+
+def save_prnu_model(prnu, camera_model, output_folder="model"):
+    """
+    Save PRNU model to file
+
+    Parameters:
+    prnu (numpy.ndarray): PRNU pattern
+    camera_model (str): Camera model name
+    output_folder (str): Output folder
+
+    Returns:
+    str: Path to saved model
+    """
+    os.makedirs(output_folder, exist_ok=True)
+    output_path = os.path.join(output_folder, f"{camera_model}.npy")
+    np.save(output_path, prnu)
+    print(f"PRNU model saved to {output_path}")
+    return output_path
+
+def load_prnu_model(model_path):
+    """
+    Load PRNU model from file
+
+    Parameters:
+    model_path (str): Path to model file
+
+    Returns:
+    numpy.ndarray: PRNU pattern
+    """
+    return np.load(model_path)
+
+def calculate_correlation(prnu1, prnu2):
+    """
+    Calculate Pearson correlation between two PRNU patterns
+
+    Parameters:
+    prnu1 (numpy.ndarray): First PRNU pattern
+    prnu2 (numpy.ndarray): Second PRNU pattern
+
+    Returns:
+    float: Pearson correlation coefficient
+    """
+    # Ensure both patterns have the same shape
+    if prnu1.shape != prnu2.shape:
+        print(f"Error: PRNU shapes don't match: {prnu1.shape} vs {prnu2.shape}")
+        min_h = min(prnu1.shape[0], prnu2.shape[0])
+        min_w = min(prnu1.shape[1], prnu2.shape[1])
+        prnu1 = prnu1[:min_h, :min_w]
+        prnu2 = prnu2[:min_h, :min_w]
+
+    # Calculate correlation
+    corr, _ = pearsonr(prnu1.flatten(), prnu2.flatten())
+
+    return corr
+
+def calculate_pce(prnu1, prnu2, peak_radius=5):
+    """
+    Calculate PCE (Peak-to-Correlation Energy) between two PRNU patterns
+
+    Parameters:
+    prnu1 (numpy.ndarray): First PRNU pattern
+    prnu2 (numpy.ndarray): Second PRNU pattern
+    peak_radius (int): Radius around the peak to exclude when calculating energy
+
+    Returns:
+    float: PCE value
+    tuple: Peak location (y, x)
+    """
+    # Ensure both patterns have the same shape
+    if prnu1.shape != prnu2.shape:
+        print(f"Error: PRNU shapes don't match: {prnu1.shape} vs {prnu2.shape}")
+        min_h = min(prnu1.shape[0], prnu2.shape[0])
+        min_w = min(prnu1.shape[1], prnu2.shape[1])
+        prnu1 = prnu1[:min_h, :min_w]
+        prnu2 = prnu2[:min_h, :min_w]
+
+    # Compute 2D correlation
+    correlation = correlate2d(prnu1, prnu2, mode='same')
+
+    # Find the peak
+    peak_y, peak_x = np.unravel_index(np.argmax(correlation), correlation.shape)
+    peak_value = correlation[peak_y, peak_x]
+
+    # Create a mask to exclude the peak region
+    mask = np.ones(correlation.shape, dtype=bool)
+    y_indices, x_indices = np.ogrid[-peak_y:correlation.shape[0]-peak_y, -peak_x:correlation.shape[1]-peak_x]
+    mask[(y_indices**2 + x_indices**2) <= peak_radius**2] = False
+
+    # Calculate energy (variance) excluding peak region
+    energy = np.var(correlation[mask])
+
+    if energy == 0:
+        return 0, (peak_y, peak_x)
+
+    # Calculate PCE
+    pce = peak_value**2 / energy
+
+    return pce, (peak_y, peak_x)
+
+def identify_source_camera(query_prnu, models_folder="model", threshold=0.01):
+    """
+    Identify the source camera by comparing with database of models
+
+    Parameters:
+    query_prnu (numpy.ndarray): PRNU of the query video
+    models_folder (str): Folder containing models
+    threshold (float): Minimum correlation threshold
+
+    Returns:
+    list: List of (camera_model, correlation, pce) sorted by correlation
+    """
+    results = []
+
+    # Get all .npy files in model folder
+    model_files = [f for f in os.listdir(models_folder) if f.endswith(".npy")]
+
+    if not model_files:
+        print(f"Warning: No models found in {models_folder}")
+        return results
+
+    for model_file in model_files:
+        model_path = os.path.join(models_folder, model_file)
+        camera_model = os.path.splitext(model_file)[0]
+
+        try:
+            model_prnu = load_prnu_model(model_path)
+
+            # Calculate correlation
+            corr = calculate_correlation(query_prnu, model_prnu)
+
+            # Calculate PCE for more reliable matching
+            pce, _ = calculate_pce(query_prnu, model_prnu)
+
+            # Store result if correlation is above threshold
+            if abs(corr) >= threshold:
+                results.append((camera_model, corr, pce))
+        except Exception as e:
+            print(f"Error processing model {model_file}: {str(e)}")
+
+    # Sort results by PCE (more reliable than correlation)
+    results.sort(key=lambda x: x[2], reverse=True)
+
+    return results
+
+def register_camera(video_path, camera_model, denoising_sigma=1.0, enhancement_factor=1.0):
+    """
+    Register a new camera by calculating its PRNU from a video
+
+    Parameters:
+    video_path (str): Path to video
+    camera_model (str): Camera model name
+    denoising_sigma (float): Denoising strength
+    enhancement_factor (float): Noise enhancement factor
+
+    Returns:
+    str: Path to saved model
+    """
+    print(f"Registering camera: {camera_model}")
+    print(f"Using denoising sigma: {denoising_sigma}, enhancement: {enhancement_factor}")
+
+    # Extract frames
+    frames_folder = os.path.join("frames", camera_model)
+    frame_paths, _ = extract_frames(video_path, frames_folder)
+
+    if not frame_paths:
+        print("Failed to extract frames")
+        return None
+
+    # Calculate PRNU with specified settings
+    prnu = calculate_prnu(
+        frame_paths,
+        denoising_sigma=denoising_sigma,
+        enhancement_factor=enhancement_factor
+    )
+
+    if prnu is None:
+        print("Failed to calculate PRNU")
+        return None
+
+    # Visualize PRNU
+    plt.figure(figsize=(10, 8))
+    plt.imshow(prnu, cmap='viridis')
+    plt.colorbar(label='PRNU Intensity')
+    plt.title(f"PRNU Pattern for {camera_model}")
+    plt.show()
+
+    # Save model
+    model_path = save_prnu_model(prnu, camera_model)
+
+    return model_path
+
+def identify_video_source(video_path, video_name=None, denoising_sigma=1.0, enhancement_factor=1.0):
+    """
+    Identify the source camera of a video
+
+    Parameters:
+    video_path (str): Path to video
+    video_name (str): Name for reference (default: derive from path)
+    denoising_sigma (float): Denoising strength
+    enhancement_factor (float): Noise enhancement factor
+
+    Returns:
+    list: Identification results [(camera_model, correlation, pce)]
+    numpy.ndarray: PRNU pattern of the video
+    """
+    if video_name is None:
+        video_name = os.path.basename(video_path).split('.')[0]
+
+    print(f"Identifying source of video: {video_name}")
+    print(f"Using denoising sigma: {denoising_sigma}, enhancement: {enhancement_factor}")
+
+    # Extract frames
+    frames_folder = os.path.join("frames", f"query_{video_name}")
+    frame_paths, _ = extract_frames(video_path, frames_folder)
+
+    if not frame_paths:
+        print("Failed to extract frames")
+        return [], None
+
+    # Calculate PRNU with specified settings
+    prnu = calculate_prnu(
+        frame_paths,
+        denoising_sigma=denoising_sigma,
+        enhancement_factor=enhancement_factor
+    )
+
+    if prnu is None:
+        print("Failed to calculate PRNU")
+        return [], None
+
+    # Visualize PRNU
+    plt.figure(figsize=(10, 8))
+    plt.imshow(prnu, cmap='viridis')
+    plt.colorbar(label='PRNU Intensity')
+    plt.title(f"PRNU Pattern for {video_name}")
+    plt.show()
+
+    # Identify source
+    results = identify_source_camera(prnu)
+
+    # Save query PRNU for reference
+    save_prnu_model(prnu, f"query_{video_name}")
+
+    # Print results
+    print("\nSource camera identification results:")
+    if results:
+        for i, (camera_model, corr, pce) in enumerate(results, 1):
+            print(f"{i}. {camera_model}: Correlation = {corr:.4f}, PCE = {pce:.2f}")
+    else:
+        print("No matching camera found in the database")
+
+    return results, prnu
+
+def extract_noise_from_frame(frame, denoising_sigma=1.0):
+    """
+    Extract noise residual from a single frame using enhanced method
+
+    Parameters:
+    frame (numpy.ndarray): Input RGB frame
+    denoising_sigma (float): Denoising strength
+
+    Returns:
+    numpy.ndarray: Noise residual
+    """
+    # Convert to grayscale if RGB
+    if len(frame.shape) == 3:
+        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    else:
+        frame_gray = frame
+
+    # Convert to float
+    frame_float = frame_gray.astype(np.float32)
+
+    # Apply denoising to get estimated noise-free image
+    denoised = denoise_image(frame_float, denoising_sigma)
+
+    # Subtract denoised image from original to get noise residual
+    noise_residual = frame_float - denoised
+
+    return noise_residual
+
+def detect_forgery(frame, reference_pattern, threshold=0.6, block_size=16):
+    """
+    Detect forged regions in a frame using PRNU correlation
+
+    Parameters:
+    frame (numpy.ndarray): Input frame
+    reference_pattern (numpy.ndarray): Reference PRNU pattern
+    threshold (float): Correlation threshold for forgery detection
+    block_size (int): Size of analysis block
+
+    Returns:
+    numpy.ndarray: Forgery mask
+    numpy.ndarray: Correlation map
+    """
+    # Extract noise from current frame
+    frame_noise = extract_noise_from_frame(frame)
+
+    # Compute correlation map between frame noise and reference pattern
+    correlation_map = np.zeros(frame_noise.shape)
+
+    # Calculate correlation for each local block with 50% overlap
+    for i in range(0, frame_noise.shape[0] - block_size, block_size // 2):
+        for j in range(0, frame_noise.shape[1] - block_size, block_size // 2):
+            # Extract blocks
+            ref_block = reference_pattern[i:i+block_size, j:j+block_size]
+            frame_block = frame_noise[i:i+block_size, j:j+block_size]
+
+            # Calculate correlation
+            corr, _ = pearsonr(ref_block.flatten(), frame_block.flatten())
+
+            # Set correlation value for all pixels in this block
+            correlation_map[i:i+block_size, j:j+block_size] += corr
+
+    # Normalize correlation map
+    if np.max(correlation_map) != np.min(correlation_map):
+        correlation_map = (correlation_map - np.min(correlation_map)) / (np.max(correlation_map) - np.min(correlation_map))
+    else:
+        correlation_map = np.zeros_like(correlation_map)
+
+    # Detect forgery - areas with low correlation to reference pattern
+    forgery_mask = correlation_map < threshold
+
+    # Apply morphological operations to clean up the mask
+    kernel = np.ones((5, 5), np.uint8)
+    forgery_mask = cv2.morphologyEx(forgery_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+
+    return forgery_mask, correlation_map
+
+def detect_tampering_in_video(video_path, reference_prnu=None, output_path=None,
+                             threshold=0.6, frame_skip=5, max_frames=100, block_size=16,
+                             visualization_interval=20):
+    """
+    Process entire video to detect forgeries with optimized processing
+
+    Parameters:
+    video_path (str): Path to video file
+    reference_prnu (numpy.ndarray): Reference PRNU pattern (optional)
+    output_path (str): Path to save output video
+    threshold (float): Correlation threshold for forgery detection
+    frame_skip (int): Process every Nth frame for efficiency
+    max_frames (int): Maximum number of frames to process
+    block_size (int): Size of analysis block
+    visualization_interval (int): Save visualization every Nth frame
+
+    Returns:
+    list: Forgery detection results
+    numpy.ndarray: Reference PRNU pattern
+    """
+    # Open video file
+    cap = cv2.VideoCapture(video_path)
+
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    print(f"Video details: {width}x{height}, {fps} fps, {frame_count} frames")
+
+    # If no reference pattern provided, create one from first part of video
+    if reference_prnu is None:
+        print("No reference PRNU provided. Extracting reference pattern from the first part of the video...")
+        ref_frames = []
+        for _ in range(min(50, frame_count)):
+            ret, frame = cap.read()
+            if ret:
+                ref_frames.append(frame)
+
+        # Extract PRNU from these frames
+        reference_prnu = calculate_prnu_from_frames(ref_frames)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset video position
+
+    # Create output video writer
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    # For visualization
+    forgery_results = []
+
+    # Process frames
+    frame_idx = 0
+    processed_frames = 0
+
+    with tqdm(total=min(frame_count, max_frames * frame_skip)) as pbar:
+        while processed_frames < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Process every 'frame_skip' frames for efficiency
+            if frame_idx % frame_skip == 0:
+                # Detect forgery in current frame
+                forgery_mask, correlation_map = detect_forgery(frame, reference_prnu, threshold, block_size)
+
+                # Create visualization
+                marked_frame = frame.copy()
+                # Apply red tint to forged regions
+                marked_frame[forgery_mask > 0] = [0, 0, 255]  # BGR format
+
+                # Blend original and marked frame
+                alpha = 0.6
+                marked_frame = cv2.addWeighted(frame, 1-alpha, marked_frame, alpha, 0)
+
+                # Store for later visualization
+                if frame_idx % (frame_skip * visualization_interval) == 0:
+                    forgery_results.append((frame_idx, frame, marked_frame, forgery_mask, correlation_map))
+
+                # Add frame to output video
+                if output_path:
+                    out.write(marked_frame)
+
+                processed_frames += 1
+
+            frame_idx += 1
+            pbar.update(1)
+
+            if frame_idx >= frame_count:
+                break
+
+    # Release resources
+    cap.release()
+    if output_path:
+        out.release()
+
+    print(f"Processed {processed_frames} frames out of {frame_idx} total frames")
+    if output_path:
+        print(f"Output saved to {output_path}")
+
+    return forgery_results, reference_prnu
+
+def calculate_prnu_from_frames(frames, denoising_sigma=1.0, enhancement_factor=1.0):
+    """
+    Calculate PRNU pattern from a list of frames
+
+    Parameters:
+    frames (list): List of RGB frames
+    denoising_sigma (float): Denoising strength
+    enhancement_factor (float): Noise enhancement factor
+
+    Returns:
+    numpy.ndarray: PRNU pattern
+    """
+    if not frames:
+        print("Error: No frames provided for PRNU calculation")
+        return None
+
+    # Get dimensions from first frame
+    first_frame = frames[0]
+    if len(first_frame.shape) == 3:
+        height, width, _ = first_frame.shape
+    else:
+        height, width = first_frame.shape
+
+    # Initialize variables for PRNU estimation
+    num = np.zeros((height, width), dtype=np.float64)
+    den = np.zeros((height, width), dtype=np.float64)
+
+    print("Calculating PRNU from frames...")
+    for frame in tqdm(frames):
+        # Convert to grayscale if RGB
+        if len(frame.shape) == 3:
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            frame_gray = frame
+
+        # Convert to float
+        frame_gray = frame_gray.astype(np.float64)
+
+        # Extract noise residual
+        noise = extract_noise_residual(frame_gray, denoising_sigma)
+
+        # Enhance noise if needed
+        if enhancement_factor > 1.0:
+            noise = enhance_noise_residual(noise, enhancement_factor)
+
+        # Update numerator and denominator
+        num += noise * frame_gray
+        den += frame_gray * frame_gray
+
+    # Avoid division by zero
+    den[den == 0] = 1
+
+    # Calculate PRNU pattern
+    k = num / den
+
+    # Normalize PRNU pattern
+    k = (k - np.mean(k)) / np.std(k)
+
+    return k
+
+def detect_object_insertion(forgery_results, min_area_percent=1.0, min_consistency=0.5):
+    """
+    Detect object insertion from forgery results with enhanced analysis
+
+    Parameters:
+    forgery_results: Results from process_video_for_forgery
+    min_area_percent: Minimum area percentage of frame to consider as object
+    min_consistency: Minimum temporal consistency to confirm object insertion
+
+    Returns:
+    dict: Object insertion detection results
+    """
+    if not forgery_results:
+        return {"detected": False, "confidence": 0.0, "reason": "No forgery results available"}
+
+    # Extract all forgery masks and create a heatmap
+    height, width = forgery_results[0][3].shape
+    heatmap = np.zeros((height, width), dtype=np.float32)
+
+    for _, _, _, mask, _ in forgery_results:
+        heatmap += mask.astype(np.float32)
+
+    # Normalize heatmap
+    if heatmap.max() > 0:
+        heatmap /= heatmap.max()
+
+    # Threshold to get consistent forged regions
+    consistent_mask = heatmap > min_consistency
+
+    # Apply morphological operations to clean up the mask
+    cleaned_mask = binary_dilation(consistent_mask, iterations=2)
+    cleaned_mask = binary_erosion(cleaned_mask, iterations=1)
+
+    # Calculate object statistics
+    labeled_mask, num_objects = label(cleaned_mask)
+    object_stats = []
+    object_area_percent = 0
+
+    for i in range(1, num_objects + 1):
+        object_mask = labeled_mask == i
+        area = np.sum(object_mask)
+        area_percent = area / (height * width) * 100
+
+        if area_percent >= min_area_percent:
+            # Get bounding box
+            y_indices, x_indices = np.where(object_mask)
+            if len(y_indices) > 0 and len(x_indices) > 0:
+                y_min, y_max = np.min(y_indices), np.max(y_indices)
+                x_min, x_max = np.min(x_indices), np.max(x_indices)
+
+                object_stats.append({
+                    'id': i,
+                    'area': area,
+                    'area_percent': area_percent,
+                    'bbox': (y_min, x_min, y_max, x_max),
+                    'width': x_max - x_min + 1,
+                    'height': y_max - y_min + 1
+                })
+
+                object_area_percent += area_percent
+
+    # Calculate temporal consistency
+    total_frames = len(forgery_results)
+    suspicious_frames = sum([np.sum(mask) > 0 for _, _, _, mask, _ in forgery_results])
+    temporal_consistency = suspicious_frames / total_frames if total_frames else 0
+
+    # Determine detection result
+    detection = {
+        "detected": False,
+        "confidence": 0.0,
+        "num_objects": len(object_stats),
+        "object_area_percent": object_area_percent,
+        "temporal_consistency": temporal_consistency,
+        "object_stats": object_stats,
+        "heatmap": heatmap,
+        "heatmap_mask": cleaned_mask
+    }
+
+    if len(object_stats) > 0 and object_area_percent >= min_area_percent:
+        if temporal_consistency >= min_consistency:
+            detection["detected"] = True
+            # Confidence combines area and consistency
+            detection["confidence"] = min(0.5 + (object_area_percent/100 * 2 + temporal_consistency)/2, 1.0)
+
+            if len(object_stats) == 1:
+                detection["reason"] = "Single object insertion detected"
+            else:
+                detection["reason"] = f"Multiple objects ({len(object_stats)}) insertion detected"
+        else:
+            detection["reason"] = "Potential objects detected but temporal consistency too low"
+    else:
+        if len(object_stats) == 0:
+            detection["reason"] = "No object-like patterns detected"
+        else:
+            detection["reason"] = f"Object area too small ({object_area_percent:.2f}% < {min_area_percent}%)"
+
+    return detection
+
+def visualize_object_insertion(forgery_results, object_detection, save_path=None):
+    """
+    Visualize detected object insertion
+
+    Parameters:
+    forgery_results (list): Results from process_video_for_forgery
+    object_detection (dict): Results from detect_object_insertion
+    save_path (str): Path to save visualization (if provided)
+    """
+    if not forgery_results or not object_detection:
+        print("No results to visualize")
+        return
+
+    plt.figure(figsize=(15, 10))
+
+    # Show up to 4 examples
+    for i, (frame_idx, original, marked, mask, corr_map) in enumerate(forgery_results[:4]):
+        # Original frame
+        plt.subplot(4, 3, i*3 + 1)
+        plt.imshow(cv2.cvtColor(original, cv2.COLOR_BGR2RGB))
+        plt.title(f"Frame {frame_idx} - Original")
+        plt.axis('off')
+
+        # Detected forgery
+        plt.subplot(4, 3, i*3 + 2)
+        plt.imshow(cv2.cvtColor(marked, cv2.COLOR_BGR2RGB))
+        plt.title("Detected Forgery")
+        plt.axis('off')
+
+        # Correlation map
+        plt.subplot(4, 3, i*3 + 3)
+        plt.imshow(corr_map, cmap='jet')
+        plt.title("Correlation Map")
+        plt.axis('off')
+
+    # If object detection results are available
+    if object_detection and object_detection["detected"]:
+        plt.figure(figsize=(12, 8))
+
+        # Show heatmap
+        plt.subplot(2, 2, 1)
+        plt.imshow(object_detection["heatmap"], cmap='hot')
+        plt.colorbar(label='Tampering Likelihood')
+        plt.title("Tampering Heatmap")
+
+        # Show cleaned mask
+        plt.subplot(2, 2, 2)
+        plt.imshow(object_detection["heatmap_mask"], cmap='binary')
+        plt.title(f"Detected Objects ({object_detection['num_objects']})")
+
+        # Show example frame with overlay
+        if forgery_results:
+            frame_idx, original, _, _, _ = forgery_results[0]
+            plt.subplot(2, 2, 3)
+            plt.imshow(cv2.cvtColor(original, cv2.COLOR_BGR2RGB))
+
+            # Draw bounding boxes
+            for obj in object_detection["object_stats"]:
+                y_min, x_min, y_max, x_max = obj['bbox']
+                rect = plt.Rectangle((x_min, y_min), x_max-x_min, y_max-y_min,
+                                    fill=False, edgecolor='red', linewidth=2)
+                plt.gca().add_patch(rect)
+                plt.text(x_min, y_min-5, f"Obj {obj['id']}", color='red')
+
+            plt.title(f"Frame {frame_idx} with Objects")
+            plt.axis('off')
+
+        # Show confidence and info
+        plt.subplot(2, 2, 4)
+        plt.axis('off')
+        info_text = f"Object Insertion Detected\n"
+        info_text += f"Confidence: {object_detection['confidence']:.2f}\n"
+        info_text += f"Objects: {object_detection['num_objects']}\n"
+        info_text += f"Total Area: {object_detection['object_area_percent']:.2f}%\n"
+        info_text += f"Consistency: {object_detection['temporal_consistency']:.2f}"
+        plt.text(0.1, 0.5, info_text, fontsize=12, bbox=dict(facecolor='white', alpha=0.8))
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path)
+        print(f"Visualization saved to {save_path}")
+
+    plt.show()
+
+def detect_tampering_and_insertion(video_path, reference_prnu=None, output_path=None,
+                                  denoising_sigma=1.0, enhancement_factor=1.0,
+                                  threshold=0.6, frame_skip=5, max_frames=100, block_size=16,
+                                  min_area_percent=1.0, min_consistency=0.5,
+                                  visualization_interval=20):
+    """
+    Analyze video for tampering and object insertion
+
+    Parameters:
+    video_path (str): Path to video file
+    reference_prnu (numpy.ndarray): Reference PRNU pattern (optional)
+    output_path (str): Path for output video
+    denoising_sigma (float): Denoising strength
+    enhancement_factor (float): Noise enhancement factor
+    threshold (float): Correlation threshold for forgery detection
+    frame_skip (int): Process every Nth frame for efficiency
+    max_frames (int): Maximum number of frames to process
+    block_size (int): Size of analysis block
+    min_area_percent (float): Minimum object area percentage
+    min_consistency (float): Minimum temporal consistency
+    visualization_interval (int): Save visualization every Nth frame
+
+    Returns:
+    dict: Tampering and insertion detection results
+    """
+    video_name = os.path.basename(video_path).split('.')[0]
+
+    # Default output path if not specified
+    if output_path is None:
+        output_path = os.path.join("results", f"{video_name}_tamper_analysis.mp4")
+
+    print(f"Analyzing video for tampering: {video_name}")
+    print(f"Parameters:")
+    print(f"- Denoising sigma: {denoising_sigma}")
+    print(f"- Enhancement factor: {enhancement_factor}")
+    print(f"- Correlation threshold: {threshold}")
+    print(f"- Frame skip: {frame_skip}")
+    print(f"- Block size: {block_size}")
+    print(f"- Min area percent: {min_area_percent}%")
+    print(f"- Min consistency: {min_consistency}")
+
+    # Detect tampering
+    forgery_results, reference_pattern = detect_tampering_in_video(
+        video_path,
+        reference_prnu=reference_prnu,
+        output_path=output_path,
+        threshold=threshold,
+        frame_skip=frame_skip,
+        max_frames=max_frames,
+        block_size=block_size,
+        visualization_interval=visualization_interval
+    )
+
+    # Detect object insertion
+    object_detection = detect_object_insertion(
+        forgery_results,
+        min_area_percent=min_area_percent,
+        min_consistency=min_consistency
+    )
+
+    # Visualize results
+    results_path = os.path.join("results", f"{video_name}_object_detection.png")
+    visualize_object_insertion(forgery_results, object_detection, results_path)
+
+    # Generate report
+    report = generate_tampering_report(forgery_results, object_detection)
+    report_path = os.path.join("results", f"{video_name}_report.txt")
+    with open(report_path, 'w') as f:
+        f.write(report)
+    print(f"Report saved to {report_path}")
+
+    # Compile and return results
+    results = {
+        'video_path': video_path,
+        'output_path': output_path,
+        'reference_pattern': reference_pattern,
+        'forgery_results': forgery_results,
+        'object_detection': object_detection
+    }
+
+    return results
+
+def generate_tampering_report(forgery_results, object_detection):
+    """
+    Generate a text report for the tampering analysis
+
+    Parameters:
+    forgery_results (list): Results from tampering detection
+    object_detection (dict): Results from object insertion detection
+
+    Returns:
+    str: Generated report
+    """
+    if not forgery_results:
+        return "No forgery results available to generate report."
+
+    report = []
+    report.append("=" * 50)
+    report.append("VIDEO TAMPERING ANALYSIS REPORT")
+    report.append("=" * 50)
+
+    # Basic information
+    frame_idx, original, _, _, _ = forgery_results[0]
+    height, width = original.shape[:2]
+    report.append(f"Resolution: {width}x{height}")
+    report.append(f"Analyzed frames: {len(forgery_results)}")
+
+    # Object insertion analysis
+    report.append("\n" + "-" * 50)
+    report.append("OBJECT INSERTION ANALYSIS:")
+
+    if object_detection["detected"]:
+        report.append(f"Result: Object insertion DETECTED")
+        report.append(f"Confidence: {object_detection['confidence']:.2f}")
+        report.append(f"Number of objects: {object_detection['num_objects']}")
+        report.append(f"Total area: {object_detection['object_area_percent']:.2f}% of frame")
+        report.append(f"Temporal consistency: {object_detection['temporal_consistency']:.2f}")
+        report.append(f"Reason: {object_detection['reason']}")
+
+        # Add object details
+        if object_detection["object_stats"]:
+            report.append("\nDetected objects:")
+            for obj in object_detection["object_stats"]:
+                report.append(f"  Object {obj['id']}:")
+                report.append(f"  - Size: {obj['width']}x{obj['height']} pixels")
+                report.append(f"  - Area: {obj['area_percent']:.2f}% of frame")
+                y_min, x_min, y_max, x_max = obj['bbox']
+                report.append(f"  - Bounding box: ({x_min},{y_min}) to ({x_max},{y_max})")
+    else:
+        report.append(f"Result: No object insertion detected")
+        report.append(f"Reason: {object_detection['reason']}")
+
+    # Conclusion
+    report.append("\n" + "-" * 50)
+    report.append("CONCLUSION:")
+
+    if object_detection["detected"]:
+        if object_detection["confidence"] > 0.8:
+            report.append("HIGH confidence of video tampering")
+        elif object_detection["confidence"] > 0.5:
+            report.append("MEDIUM confidence of video tampering")
+        else:
+            report.append("LOW confidence of video tampering")
+    else:
+        report.append("No conclusive evidence of tampering detected")
+
+    return "\n".join(report)
+
+def main():
+    """Main program for the video forensics tool"""
+
+    # Create necessary directories
+    os.makedirs("model", exist_ok=True)
+    os.makedirs("frames", exist_ok=True)
+    os.makedirs("results", exist_ok=True)
+
+    while True:
+        print("\n" + "=" * 50)
+        print("VIDEO FORENSICS TOOL")
+        print("=" * 50)
+        print("1. Register Camera (add to PRNU database)")
+        print("2. Identify Camera Source")
+        print("3. Detect Tampering & Object Insertion")
+        print("4. List Registered Cameras")
+        print("5. Exit")
+
+        choice = input("\nEnter your choice (1-5): ")
+
+        if choice == "1":
+            # Register camera
+            video_path = input("\nEnter path to video file: ")
+            if not os.path.isfile(video_path):
+                print(f"Error: File {video_path} does not exist.")
+                continue
+
+            camera_model = input("Enter camera model name: ")
+
+            # Get parameters
+            denoising_sigma = float(input("Enter denoising sigma (default: 1.0): ") or "1.0")
+            enhancement_factor = float(input("Enter noise enhancement factor (default: 1.0): ") or "1.0")
+
+            # Register camera
+            register_camera(video_path, camera_model, denoising_sigma, enhancement_factor)
+
+        elif choice == "2":
+            # Identify camera source
+            video_path = input("\nEnter path to video file: ")
+            if not os.path.isfile(video_path):
+                print(f"Error: File {video_path} does not exist.")
+                continue
+
+            # Get parameters
+            denoising_sigma = float(input("Enter denoising sigma (default: 1.0): ") or "1.0")
+            enhancement_factor = float(input("Enter noise enhancement factor (default: 1.0): ") or "1.0")
+
+            # Identify source
+            identify_video_source(video_path, denoising_sigma=denoising_sigma, enhancement_factor=enhancement_factor)
+
+        elif choice == "3":
+            # Detect tampering
+            video_path = input("\nEnter path to video file: ")
+            if not os.path.isfile(video_path):
+                print(f"Error: File {video_path} does not exist.")
+                continue
+
+            # Get reference PRNU
+            reference_prnu = None
+            use_reference = input("Use reference PRNU from database? (y/n, default: n): ").lower() == 'y'
+
+            if use_reference:
+                # List available models
+                models = [f for f in os.listdir("model") if f.endswith(".npy")]
+                if not models:
+                    print("No camera models found in database.")
+                    continue
+
+                print("\nAvailable camera models:")
+                for i, model in enumerate(models, 1):
+                    print(f"{i}. {os.path.splitext(model)[0]}")
+
+                model_idx = int(input("\nSelect camera model (number): ")) - 1
+                if 0 <= model_idx < len(models):
+                    model_path = os.path.join("model", models[model_idx])
+                    reference_prnu = load_prnu_model(model_path)
+                    print(f"Loaded reference PRNU from {models[model_idx]}")
+                else:
+                    print("Invalid selection.")
+                    continue
+
+            # Get parameters
+            print("\nEnter tampering detection parameters:")
+            denoising_sigma = float(input("Denoising sigma (default: 1.0): ") or "1.0")
+            enhancement_factor = float(input("Noise enhancement factor (default: 1.0): ") or "1.0")
+            threshold = float(input("Correlation threshold (default: 0.6): ") or "0.6")
+            frame_skip = int(input("Frame skip (default: 5): ") or "5")
+            max_frames = int(input("Maximum frames to process (default: 100): ") or "100")
+            block_size = int(input("Analysis block size (default: 16): ") or "16")
+
+            print("\nEnter object insertion detection parameters:")
+            min_area_percent = float(input("Minimum object area percent (default: 1.0): ") or "1.0")
+            min_consistency = float(input("Minimum temporal consistency (default: 0.5): ") or "0.5")
+            visualization_interval = int(input("Visualization interval (default: 20): ") or "20")
+
+            # Output path
+            output_folder = "results"
+            video_name = os.path.basename(video_path).split('.')[0]
+            output_path = os.path.join(output_folder, f"{video_name}_tamper_analysis.mp4")
+
+            # Detect tampering
+            detect_tampering_and_insertion(
+                video_path,
+                reference_prnu=reference_prnu,
+                output_path=output_path,
+                denoising_sigma=denoising_sigma,
+                enhancement_factor=enhancement_factor,
+                threshold=threshold,
+                frame_skip=frame_skip,
+                max_frames=max_frames,
+                block_size=block_size,
+                min_area_percent=min_area_percent,
+                min_consistency=min_consistency,
+                visualization_interval=visualization_interval
+            )
+
+        elif choice == "4":
+            # List registered cameras
+            models = [f for f in os.listdir("model") if f.endswith(".npy")]
+
+            if not models:
+                print("\nNo camera models found in database.")
+            else:
+                print("\nRegistered cameras:")
+                for i, model in enumerate(models, 1):
+                    print(f"{i}. {os.path.splitext(model)[0]}")
+
+        elif choice == "5":
+            # Exit
+            print("\nExiting...")
+            break
+
+        else:
+            print("\nInvalid choice. Please try again.")
+
+if __name__ == "__main__":
+    main()
